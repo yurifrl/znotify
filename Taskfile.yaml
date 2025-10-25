@@ -1,0 +1,38 @@
+version: '3'
+
+tasks:
+  build:
+    desc: "Build and install zellij-notify plugin (auto-bumps version)"
+    cmds:
+      - perl -i -pe 's/version = "(\d+)\.(\d+)\.(\d+)"/"version = \"$1.$2." . ($3+1) . "\""/e' Cargo.toml
+      - echo "📦 Version $(grep '^version = ' Cargo.toml | cut -d'"' -f2)"
+      - cargo build --release --target wasm32-wasip1
+      - cp target/wasm32-wasip1/release/zellij_notify.wasm ~/.config/zellij/plugins/zellij-notify.wasm
+      - echo "✅ Plugin installed to ~/.config/zellij/plugins/zellij-notify.wasm"
+      - LOG_FILE=$(find /tmp /var/folders -path "*/zellij-*/zellij-log/zellij.log" 2>/dev/null | head -1) && > "$LOG_FILE"
+      - echo "🧹 Logs cleared"
+      - zellij action start-or-reload-plugin file:~/.config/zellij/plugins/zellij-notify.wasm
+      - echo "🔄 Plugin reloaded in Zellij"
+
+  logs:
+    desc: "View Zellij plugin logs"
+    cmds:
+      - |
+        echo "🔍 Finding Zellij log file..."
+        LOG_FILE=$(find /tmp /var/folders -path "*/zellij-*/zellij-log/zellij.log" 2>/dev/null | head -1)
+
+        if [ -z "$LOG_FILE" ]; then
+          echo "❌ No log file found. Make sure Zellij is running."
+          exit 1
+        fi
+
+        echo "📜 Log file: $LOG_FILE"
+        echo "========================================"
+        echo "Last 100 lines (filtered for zellij-notify):"
+        echo "========================================"
+        tail -100 "$LOG_FILE" | grep "\[zellij-notify\]" || echo "No [zellij-notify] logs found"
+        echo ""
+        echo "========================================"
+        echo "Tailing logs (Ctrl+C to stop)..."
+        echo "========================================"
+        tail -f "$LOG_FILE" | grep --line-buffered "\[zellij-notify\]"
