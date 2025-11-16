@@ -2,11 +2,12 @@ version: '3'
 
 tasks:
   build:
-    desc: "Build zellij-notify plugin (auto-bumps version)"
+    desc: "Build plugin + CLI, install CLI binary"
     cmds:
-      - perl -i -pe 's/version = "(\d+)\.(\d+)\.(\d+)"/"version = \"$1.$2." . ($3+1) . "\""/e' Cargo.toml
-      - echo "📦 Version $(grep '^version = ' Cargo.toml | cut -d'"' -f2)"
       - cargo build --release --target wasm32-wasip1
+      - cd cli && cargo build --release
+      - cp cli/target/release/znotify ~/.local/bin/znotify
+      - echo "✅ Built and installed znotify CLI"
 
   install:
     desc: "Install plugin and reload in Zellij"
@@ -21,6 +22,11 @@ tasks:
     desc: "Add Claude Code hooks to settings"
     cmds:
       - ./scripts/setup-claude-hooks.sh
+
+  run:
+    desc: "Run znotify CLI without install (like go run)"
+    cmds:
+      - cargo run --manifest-path cli/Cargo.toml -- {{.CLI_ARGS}}
 
   logs:
     desc: "View Zellij plugin logs"
