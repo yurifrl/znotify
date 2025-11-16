@@ -1,6 +1,6 @@
 [package]
 name = "zellij-notify"
-version = "0.1.49"
+version = "0.1.51"
 edition = "2021"
 authors = ["Yuri"]
 description = "A Zellij plugin that adds status emojis to tabs and auto-cleans them on focus"

@@ -244,6 +244,13 @@ impl ZellijPlugin for State {
                 if self.debug {
                     eprintln!("[zellij-notify] 📝 Renaming tab {}: '{}' → '{}'",
                         tab.position, tab.name, new_name);
+
+                    // Summary log: TAB_NAME in SESSION_NAME EMOJI
+                    let session_name = pipe_message.args.get("session_name")
+                        .map(|s| s.as_str())
+                        .unwrap_or("unknown");
+                    eprintln!("[zellij-notify] 📍 {} in {} {}",
+                        cleaned_name, session_name, emoji);
                 }
 
                 // Zellij uses 1-based indexing, position is 0-based
