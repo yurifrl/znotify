@@ -1,0 +1,1 @@
+/Users/yuri/Workdir/Yuri/zellij-notify/cli/target/debug/znotify: /Users/yuri/Workdir/Yuri/zellij-notify/cli/../target/wasm32-wasip1/release/zellij_notify.wasm /Users/yuri/Workdir/Yuri/zellij-notify/cli/build.rs /Users/yuri/Workdir/Yuri/zellij-notify/cli/src/../../target/wasm32-wasip1/release/zellij_notify.wasm /Users/yuri/Workdir/Yuri/zellij-notify/cli/src/main.rs

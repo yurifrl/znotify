@@ -8,8 +8,11 @@ A Zellij plugin that adds status emojis to your current tab and automatically cl
 Append status emojis to your current tab using Zellij's pipe command:
 
 ```bash
-# Use default emoji (✅)
-zellij pipe -n "notify" -a "pane_id=$ZELLIJ_PANE_ID"
+# Mark current pane/tab as completed
+zellij pipe --name "notify::completed::$ZELLIJ_PANE_ID" -- ""
+
+# Mark current pane/tab as waiting
+zellij pipe --name "notify::waiting::$ZELLIJ_PANE_ID" -- ""
 ```
 
 Perfect for integration with shell scripts, CI/CD, or IDE hooks to show task status!
@@ -61,13 +64,13 @@ load_plugins {
 ### Basic Pipe Commands
 
 ```bash
-# Append default emoji to current tab
-zellij pipe -n "notify" ""
+# Preferred format
+zellij pipe --name "notify::completed::$ZELLIJ_PANE_ID" -- ""   # Tab becomes "myproject ✅"
+zellij pipe --name "notify::waiting::$ZELLIJ_PANE_ID" -- ""     # Tab becomes "myproject ⏳"
 
-# Use preset emojis
-
-zellij pipe -n "notify" -a "pane_id=$ZELLIJ_PANE_ID" "stop"           # Tab becomes "myproject ✅"
-zellij pipe -n "notify" -a "pane_id=$ZELLIJ_PANE_ID" "notification"   # Tab becomes "myproject ⚡"
+# Legacy format still supported
+zellij pipe -n "notify" -a "pane_id=$ZELLIJ_PANE_ID" "stop"
+zellij pipe -n "notify" -a "pane_id=$ZELLIJ_PANE_ID" "notification"
 ```
 
 ### Why pass pane_id?
@@ -85,14 +88,14 @@ Example with Claude Code (`~/.claude/settings.json`):
       "matcher": "",
       "hooks": [{
         "type": "command",
-        "command": "zellij pipe -n \"notify\" -a \"pane_id=$ZELLIJ_PANE_ID\" \"posttooluse\""
+        "command": "zellij pipe --name \"notify::waiting::$ZELLIJ_PANE_ID\" -- \"\""
       }]
     }],
     "Stop": [{
       "matcher": "",
       "hooks": [{
         "type": "command",
-        "command": "zellij pipe -n \"notify\" -a \"pane_id=$ZELLIJ_PANE_ID\" \"stop\""
+        "command": "zellij pipe --name \"notify::completed::$ZELLIJ_PANE_ID\" -- \"\""
       }]
     }]
   }
