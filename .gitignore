@@ -3,6 +3,7 @@
 .worktrees
 
 # Rust build artifacts
+cli/target/
 /target/
 /debug/
 /release/
