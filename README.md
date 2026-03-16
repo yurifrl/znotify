@@ -1,54 +1,79 @@
 # zellij-notify
 
-A Zellij plugin that adds status emojis to your current tab and automatically cleans them when you switch tabs.
+A Zellij plugin that adds status emojis to tab names and automatically removes them when focus changes or state becomes stale.
 
 ## Features
 
 ### 🎯 Pipe Command Integration
-Append status emojis to your current tab using Zellij's pipe command:
+Append a status emoji to the tab that owns the pane:
 
 ```bash
-# Mark current pane/tab as completed
-zellij pipe --name "notify::completed::$ZELLIJ_PANE_ID" -- ""
+# Preferred: put the emoji directly in the pipe name
+zellij pipe --name "notify::✅::$ZELLIJ_PANE_ID" -- ""
+zellij pipe --name "notify::⚡::$ZELLIJ_PANE_ID" -- ""
+zellij pipe --name "notify::🔴::$ZELLIJ_PANE_ID" -- ""
 
-# Mark current pane/tab as waiting
-zellij pipe --name "notify::waiting::$ZELLIJ_PANE_ID" -- ""
+# Preset keys also work
+zellij pipe --name "notify::stop::$ZELLIJ_PANE_ID" -- ""
+zellij pipe --name "notify::notification::$ZELLIJ_PANE_ID" -- ""
+zellij pipe --name "notify::subagent-stop::$ZELLIJ_PANE_ID" -- ""
 ```
 
-Perfect for integration with shell scripts, CI/CD, or IDE hooks to show task status!
+This works well with shell scripts, hooks, and background commands.
 
 ### 🧹 Auto-Cleanup
-When you switch to a tab, trailing status emojis are automatically removed. This prevents clutter from accumulating as you work.
+The plugin removes trailing status emojis when they become stale, so tab names do not accumulate old status markers.
 
-Cleaned emojis: ✅ ❌ 🔴 ⚠️ ⚡ 💼 🎉 ❓
+Known icons cleaned automatically include: `✅ ❌ 🔴 ⚠️ ⚡ 💼 🎉 ❓ ⏳`
+
+### ⚙️ Configurable Presets
+You can still define named presets in Zellij config and trigger them by key, while using raw emoji names when convenient.
 
 ## Installation
 
 ### Prerequisites
 - Rust toolchain with `wasm32-wasip1` target
-- [Task](https://taskfile.dev) (optional, for easier building)
+- [Task](https://taskfile.dev)
 - Zellij terminal multiplexer
 
-Add the WASM target if you don't have it:
+Add the WASM target if needed:
+
 ```bash
 rustup target add wasm32-wasip1
 ```
 
-### Build and Install
+### Build, Install, and Reload
+
+Preferred development workflow:
+
+```bash
+task build
+```
+
+This builds the WASM plugin, installs it, clears logs, and reloads it in Zellij.
+
+### Manual Build
+
+If you only want the artifact:
 
 ```bash
 cargo build --release --target wasm32-wasip1
-cp target/wasm32-wasip1/release/zellij_notify.wasm ~/.config/zellij/plugins/
 ```
 
-### Configuration
+Output:
 
-Add to your Zellij config at `~/.config/zellij/config.kdl`:
+```text
+target/wasm32-wasip1/release/zellij_notify.wasm
+```
+
+## Configuration
+
+Add to `~/.config/zellij/config.kdl`:
 
 ```kdl
 load_plugins {
     "file:~/.config/zellij/plugins/zellij-notify.wasm" {
-        debug "false"  // Optional: set to "true" for verbose logging
+        debug "false"
         presets r#"{
             "notification": {"emoji": "⚡"},
             "posttooluse": {"emoji": "⚡"},
@@ -59,69 +84,57 @@ load_plugins {
 }
 ```
 
+### Config Keys
+- `debug`: `"true"` enables verbose logging
+- `presets`: JSON object mapping preset name to `{ "emoji": "..." }`
+
+Built-in preset aliases include:
+- `notification` → `⚡`
+- `posttooluse` → `⚡`
+- `stop` → `✅`
+- `subagent-stop` → `🔴`
+- `waiting` → `⏳`
+- `completed` → `✅`
+
 ## Usage
 
 ### Basic Pipe Commands
 
 ```bash
-# Preferred format
-zellij pipe --name "notify::completed::$ZELLIJ_PANE_ID" -- ""   # Tab becomes "myproject ✅"
-zellij pipe --name "notify::waiting::$ZELLIJ_PANE_ID" -- ""     # Tab becomes "myproject ⏳"
+# Preferred: direct emoji format
+zellij pipe --name "notify::✅::$ZELLIJ_PANE_ID" -- ""  # tab -> "myproject ✅"
+zellij pipe --name "notify::⚡::$ZELLIJ_PANE_ID" -- ""  # tab -> "myproject ⚡"
+zellij pipe --name "notify::🔴::$ZELLIJ_PANE_ID" -- ""  # tab -> "myproject 🔴"
 
-# Legacy format still supported
+# Preset keys also work
+zellij pipe --name "notify::stop::$ZELLIJ_PANE_ID" -- ""
+zellij pipe --name "notify::notification::$ZELLIJ_PANE_ID" -- ""
+zellij pipe --name "notify::subagent-stop::$ZELLIJ_PANE_ID" -- ""
+
+# Legacy format is still supported
 zellij pipe -n "notify" -a "pane_id=$ZELLIJ_PANE_ID" "stop"
 zellij pipe -n "notify" -a "pane_id=$ZELLIJ_PANE_ID" "notification"
 ```
 
-### Why pass pane_id?
+### Why include `pane_id`?
 
-When a command executes in the background (after you've switched tabs), Zellij needs to know which tab sent the command. The `ZELLIJ_PANE_ID` environment variable identifies the source pane, and the plugin uses this to find the correct tab.
+When a command finishes in the background, you may already be on another tab. Including `ZELLIJ_PANE_ID` lets the plugin map the event back to the correct tab.
 
-### Claude Hook Integration
+With the preferred format, the pane id is embedded in the pipe name:
 
-Example with Claude Code (`~/.claude/settings.json`):
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [{
-      "matcher": "",
-      "hooks": [{
-        "type": "command",
-        "command": "zellij pipe --name \"notify::waiting::$ZELLIJ_PANE_ID\" -- \"\""
-      }]
-    }],
-    "Stop": [{
-      "matcher": "",
-      "hooks": [{
-        "type": "command",
-        "command": "zellij pipe --name \"notify::completed::$ZELLIJ_PANE_ID\" -- \"\""
-      }]
-    }]
-  }
-}
-```
-
-## Configuration Options
-
-### Debug Logging
-
-Set `debug "true"` in the plugin config to enable verbose logging:
-
-```kdl
-"file:~/.config/zellij/plugins/zellij-notify.wasm" {
-    debug "true"
-}
-```
-
-View logs with:
 ```bash
-task logs
+zellij pipe --name "notify::✅::$ZELLIJ_PANE_ID" -- ""
+```
+
+With the legacy format, it is passed as an argument:
+
+```bash
+zellij pipe -n "notify" -a "pane_id=$ZELLIJ_PANE_ID" "stop"
 ```
 
 ### Custom Presets
 
-Define your own emoji presets in the config:
+Define your own presets:
 
 ```kdl
 presets r#"{
@@ -132,31 +145,70 @@ presets r#"{
 }"#
 ```
 
+Then trigger them by key:
+
+```bash
+zellij pipe --name "notify::success::$ZELLIJ_PANE_ID" -- ""
+```
+
+You can also skip presets and send the emoji directly:
+
+```bash
+zellij pipe --name "notify::🎉::$ZELLIJ_PANE_ID" -- ""
+```
+
+### Claude Code Hook Integration
+
+Example `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "",
+      "hooks": [{
+        "type": "command",
+        "command": "zellij pipe --name \"notify::⚡::$ZELLIJ_PANE_ID\" -- \"\""
+      }]
+    }],
+    "Stop": [{
+      "matcher": "",
+      "hooks": [{
+        "type": "command",
+        "command": "zellij pipe --name \"notify::✅::$ZELLIJ_PANE_ID\" -- \"\""
+      }]
+    }]
+  }
+}
+```
+
+If you use the bundled CLI, these are equivalent:
+
+```bash
+znotify notify notification
+znotify notify stop
+znotify notify ✅
+znotify notify ⚡
+```
+
 ## How It Works
 
-### Pane-to-Tab Mapping
-
-For background commands that execute after you've switched tabs, the plugin needs to identify the source tab:
-
-1. You pass `ZELLIJ_PANE_ID` via the `-a` flag in your command
-2. Plugin receives the pane ID in `pipe_message.args`
-3. Plugin subscribes to `PaneUpdate` events to maintain a `PaneManifest`
-4. Plugin searches the manifest to find which tab contains the pane
-5. Plugin updates the correct tab, even if you've switched to a different one
-
-This is why passing `pane_id` is important for background commands!
+1. The plugin subscribes to `TabUpdate` and `PaneUpdate` events.
+2. It keeps a pane-to-tab mapping from Zellij's `PaneManifest`.
+3. A pipe message stores notification state per pane.
+4. The latest notification for panes in a tab determines the tab suffix.
+5. When state clears or becomes stale, the original tab name is restored.
 
 ## Development
 
 ```bash
-# Build, install, and reload in one command
+# Build, install, and reload
 task build
 
-# View plugin logs
+# View logs
 task logs
 ```
 
-
 ## License
 
-MIT License - see LICENSE file for details
+MIT License - see `LICENSE` for details.

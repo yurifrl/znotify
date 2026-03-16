@@ -1,300 +1,486 @@
-use std::collections::{BTreeMap, HashMap};
+pub mod config;
+pub mod state;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use zellij_tile::prelude::*;
-use serde::Deserialize;
+use zellij_tile::shim::{rename_tab, unblock_cli_pipe_input};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use crate::config::NotificationConfig;
+use crate::state::NotificationState;
 
-// Manual WASM entry point for cdylib
 #[no_mangle]
 pub unsafe extern "C" fn _start() {}
 
-#[derive(Deserialize, Clone)]
-struct PresetConfig {
-    emoji: String,
-}
-
 #[derive(Default)]
-struct State {
-    all_tabs: Vec<TabInfo>,  // Store ALL tabs, not just the active one
-    focused_tab_position: Option<usize>,  // Track which tab is currently focused
-    pane_manifest: Option<PaneManifest>,  // Map panes to their tab positions
-    presets: HashMap<String, PresetConfig>,
-    debug: bool,
+pub struct State {
+    permissions_granted: bool,
+    pub(crate) tabs: Vec<TabInfo>,
+    pub(crate) panes: PaneManifest,
+    pub(crate) notification_state: HashMap<u32, NotificationState>,
+    pub(crate) original_tab_names: HashMap<usize, String>,
+    pub(crate) config: NotificationConfig,
+    pub(crate) debug: bool,
+    updating_tabs: bool,
+    pub(crate) last_focused_pane_id: Option<u32>,
+    /// Tab positions where we've issued a rename to strip stale icons.
+    /// Prevents re-stripping on the bounced TabUpdate before Zellij catches up.
+    pub(crate) pending_strips: HashSet<usize>,
+    next_sequence: u64,
 }
 
 register_plugin!(State);
 
-impl ZellijPlugin for State {
-    fn load(&mut self, configuration: BTreeMap<String, String>) {
-        // Parse debug flag from config (default: false)
-        self.debug = configuration.get("debug")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(false);
+impl State {
+    fn determine_focused_pane(&self) -> Option<u32> {
+        let active_tab = self.tabs.iter().find(|t| t.active)?;
+        let panes = self.panes.panes.get(&active_tab.position)?;
+        let focused = panes.iter().find(|p| {
+            !p.is_plugin
+                && p.is_focused
+                && (p.is_floating == active_tab.are_floating_panes_visible)
+        })?;
+        Some(focused.id)
+    }
 
-        if self.debug {
-            eprintln!("[zellij-notify] 🚀 Plugin loaded - Version {}", VERSION);
+    /// Clears notifications for the pane that just lost focus.
+    /// Returns true if any notification was cleared.
+    pub(crate) fn check_and_clear_blur(&mut self) -> bool {
+        let Some(focused_pane_id) = self.determine_focused_pane() else {
+            return false;
+        };
+
+        if self.last_focused_pane_id == Some(focused_pane_id) {
+            return false;
         }
 
-        subscribe(&[EventType::TabUpdate, EventType::PaneUpdate]);
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::ChangeApplicationState
-        ]);
+        let previous_focused_pane_id = self.last_focused_pane_id.replace(focused_pane_id);
 
-        // Parse presets from config
-        if let Some(presets_json) = configuration.get("presets") {
-            match serde_json::from_str(presets_json) {
-                Ok(presets) => {
-                    self.presets = presets;
-                    if self.debug {
-                        eprintln!("[zellij-notify] ✅ Loaded {} presets from config", self.presets.len());
-                    }
+        if let Some(previous_focused_pane_id) = previous_focused_pane_id {
+            if self
+                .notification_state
+                .remove(&previous_focused_pane_id)
+                .is_some()
+            {
+                if self.debug {
+                    eprintln!(
+                        "[zellij-notify] Cleared notifications for blurred pane {}",
+                        previous_focused_pane_id
+                    );
                 }
-                Err(e) => {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Removes notification entries for pane IDs that no longer exist.
+    /// Returns true if any stale entries were removed.
+    pub(crate) fn clean_stale_notifications(&mut self) -> bool {
+        if self.notification_state.is_empty() || self.panes.panes.is_empty() {
+            return false;
+        }
+
+        let current_pane_ids: HashSet<u32> = self
+            .panes
+            .panes
+            .values()
+            .flat_map(|panes| panes.iter().filter(|p| !p.is_plugin).map(|p| p.id))
+            .collect();
+
+        let stale_ids: Vec<u32> = self
+            .notification_state
+            .keys()
+            .filter(|id| !current_pane_ids.contains(id))
+            .copied()
+            .collect();
+
+        if stale_ids.is_empty() {
+            return false;
+        }
+
+        for id in &stale_ids {
+            self.notification_state.remove(id);
+            if self.debug {
+                eprintln!("[zellij-notify] Removed stale notification for pane {}", id);
+            }
+        }
+
+        true
+    }
+
+    /// Returns true if there are original_tab_names entries waiting to be
+    /// restored (ie. their tab positions have no active notifications).
+    pub(crate) fn has_pending_restores(&self) -> bool {
+        self.original_tab_names
+            .keys()
+            .any(|pos| self.get_tab_notification_state(*pos).is_none())
+    }
+
+    /// Returns true if any tab has a stale icon suffix with no active notification.
+    pub(crate) fn has_stale_icons(&self) -> bool {
+        for tab in &self.tabs {
+            if self.get_tab_notification_state(tab.position).is_some() {
+                continue;
+            }
+            if self.original_tab_names.contains_key(&tab.position) {
+                continue; // handled by restore logic
+            }
+            if self.pending_strips.contains(&tab.position) {
+                continue; // already issued a strip, waiting for Zellij to catch up
+            }
+            if self.tab_name_has_icon(&tab.name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Checks if a tab name ends with one of our notification icon suffixes.
+    pub(crate) fn tab_name_has_icon(&self, name: &str) -> bool {
+        self.config
+            .all_icons()
+            .into_iter()
+            .any(|icon| name.ends_with(&format!(" {}", icon)))
+    }
+
+    /// Strips notification icon suffixes from a tab name.
+    pub(crate) fn strip_icons(&self, name: &str) -> String {
+        let icons = self.config.all_icons();
+        let mut cleaned = name.to_string();
+
+        loop {
+            let original_len = cleaned.len();
+            cleaned = cleaned.trim_end().to_string();
+
+            let mut found_icon = false;
+            for icon in &icons {
+                let suffix = format!(" {}", icon);
+                if cleaned.ends_with(&suffix) {
+                    cleaned.truncate(cleaned.len() - suffix.len());
+                    found_icon = true;
+                    break;
+                }
+            }
+
+            if !found_icon && cleaned.len() == original_len {
+                break;
+            }
+        }
+
+        cleaned
+    }
+
+    /// Returns the latest notification state for a tab.
+    pub(crate) fn get_tab_notification_state(
+        &self,
+        tab_position: usize,
+    ) -> Option<NotificationState> {
+        let panes = self.panes.panes.get(&tab_position)?;
+
+        panes
+            .iter()
+            .filter(|pane| !pane.is_plugin)
+            .filter_map(|pane| self.notification_state.get(&pane.id))
+            .max_by_key(|notification| notification.sequence)
+            .cloned()
+    }
+
+    fn parse_pipe_message(pipe_message: &PipeMessage) -> Result<(String, u32), &'static str> {
+        if pipe_message.name.starts_with("notify::") {
+            let mut parts = pipe_message.name.splitn(3, "::");
+            let _ = parts.next();
+            let event_name = parts.next().ok_or("Missing event name in pipe name")?;
+            let pane_id = parts
+                .next()
+                .ok_or("Missing pane_id in pipe name")?
+                .parse::<u32>()
+                .map_err(|_| "Invalid pane_id in pipe name")?;
+            return Ok((event_name.to_string(), pane_id));
+        }
+
+        if let Some(ref payload) = pipe_message.payload {
+            if payload.starts_with("notify::") {
+                let mut parts = payload.splitn(3, "::");
+                let _ = parts.next();
+                let event_name = parts.next().ok_or("Missing event name in payload")?;
+                let pane_id = parts
+                    .next()
+                    .ok_or("Missing pane_id in payload")?
+                    .parse::<u32>()
+                    .map_err(|_| "Invalid pane_id in payload")?;
+                return Ok((event_name.to_string(), pane_id));
+            }
+
+            if pipe_message.name == "notify" {
+                let pane_id = pipe_message
+                    .args
+                    .get("pane_id")
+                    .ok_or("Missing pane_id arg")?
+                    .parse::<u32>()
+                    .map_err(|_| "Invalid pane_id arg")?;
+                return Ok((payload.clone(), pane_id));
+            }
+
+            return Err("ignoring pipe, no notify:: prefix");
+        }
+
+        if pipe_message.name == "notify" {
+            let pane_id = pipe_message
+                .args
+                .get("pane_id")
+                .ok_or("Missing pane_id arg")?
+                .parse::<u32>()
+                .map_err(|_| "Invalid pane_id arg")?;
+            return Ok((String::new(), pane_id));
+        }
+
+        Err("ignoring pipe, no match")
+    }
+
+    /// Updates tab names to show notification icons or restore original names.
+    /// Only called when notification state changes (pipe received, notification cleared).
+    fn update_tab_names(&mut self) {
+        if self.updating_tabs || !self.config.enabled {
+            return;
+        }
+        self.updating_tabs = true;
+
+        let mut notified_positions: HashSet<usize> = HashSet::new();
+
+        for tab in &self.tabs {
+            if let Some(notification) = self.get_tab_notification_state(tab.position) {
+                notified_positions.insert(tab.position);
+
+                if !self.original_tab_names.contains_key(&tab.position) {
+                    let original = if tab.name.is_empty() {
+                        format!("Tab #{}", tab.position + 1)
+                    } else {
+                        self.strip_icons(&tab.name)
+                    };
+                    self.original_tab_names.insert(tab.position, original);
+                }
+
+                let original = self
+                    .original_tab_names
+                    .get(&tab.position)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Tab #{}", tab.position + 1));
+                let new_name = format!("{} {}", original, notification.emoji);
+
+                if tab.name != new_name {
                     if self.debug {
-                        eprintln!("[zellij-notify] ⚠️  Failed to parse presets: {}", e);
+                        eprintln!(
+                            "[zellij-notify] RENAME tab pos={} '{}' -> '{}' ({})",
+                            tab.position, tab.name, new_name, notification.name
+                        );
+                    }
+                    rename_tab((tab.position + 1) as u32, &new_name);
+                }
+            }
+        }
+
+        // Restore original names for tabs whose notifications were cleared.
+        let positions_to_restore: Vec<usize> = self
+            .original_tab_names
+            .keys()
+            .filter(|pos| !notified_positions.contains(pos))
+            .cloned()
+            .collect();
+
+        for pos in positions_to_restore {
+            if let Some(tab) = self.tabs.iter().find(|t| t.position == pos) {
+                if let Some(original_name) = self.original_tab_names.remove(&pos) {
+                    if tab.name != original_name {
+                        if self.debug {
+                            eprintln!(
+                                "[zellij-notify] RESTORE tab pos={} '{}' -> '{}'",
+                                pos, tab.name, original_name
+                            );
+                        }
+                        rename_tab((pos + 1) as u32, &original_name);
                     }
                 }
             }
+        }
+
+        // Strip stale icons from tabs that have no notification and no pending restore.
+        for tab in &self.tabs {
+            if notified_positions.contains(&tab.position) {
+                self.pending_strips.remove(&tab.position);
+                continue;
+            }
+            if self.original_tab_names.contains_key(&tab.position) {
+                self.pending_strips.remove(&tab.position);
+                continue;
+            }
+            if self.pending_strips.contains(&tab.position) {
+                if !self.tab_name_has_icon(&tab.name) {
+                    self.pending_strips.remove(&tab.position);
+                }
+                continue;
+            }
+            if self.tab_name_has_icon(&tab.name) {
+                let clean_name = self.strip_icons(&tab.name);
+                if self.debug {
+                    eprintln!(
+                        "[zellij-notify] STRIP stale icon from tab pos={} '{}' -> '{}'",
+                        tab.position, tab.name, clean_name
+                    );
+                }
+                self.pending_strips.insert(tab.position);
+                rename_tab((tab.position + 1) as u32, &clean_name);
+            }
+        }
+
+        // Clean up cached names for tabs that no longer exist.
+        if !self.tabs.is_empty() {
+            let valid_positions: HashSet<usize> = self.tabs.iter().map(|t| t.position).collect();
+            self.original_tab_names
+                .retain(|pos, _| valid_positions.contains(pos));
+            self.pending_strips.retain(|pos| valid_positions.contains(pos));
+        }
+
+        self.updating_tabs = false;
+    }
+}
+
+impl ZellijPlugin for State {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.debug = configuration
+            .get("debug")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(false);
+
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+            PermissionType::MessageAndLaunchOtherPlugins,
+            PermissionType::ReadCliPipes,
+        ]);
+
+        subscribe(&[
+            EventType::PermissionRequestResult,
+            EventType::TabUpdate,
+            EventType::PaneUpdate,
+        ]);
+
+        self.config = NotificationConfig::from_configuration(&configuration);
+
+        if self.debug {
+            eprintln!(
+                "[zellij-notify] v{} loaded with {} presets",
+                env!("CARGO_PKG_VERSION"),
+                self.config.presets.len()
+            );
         }
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
-            Event::TabUpdate(tabs) => {
+            Event::PermissionRequestResult(status) => {
+                self.permissions_granted = status == PermissionStatus::Granted;
+                set_selectable(false);
+
                 if self.debug {
-                    eprintln!("[zellij-notify] v{}", VERSION);
-                    eprintln!("[zellij-notify] 📋 TAB UPDATE: {} tabs total", tabs.len());
+                    eprintln!(
+                        "[zellij-notify] permissions {:?}",
+                        if self.permissions_granted {
+                            "granted"
+                        } else {
+                            "denied"
+                        }
+                    );
                 }
 
-                // Store ALL tabs (not just the active one)
-                self.all_tabs = tabs.clone();
-
-                // Find the currently focused tab
-                for (idx, tab) in tabs.iter().enumerate() {
-                    if tab.active {
-                        let is_new_focus = self.focused_tab_position != Some(tab.position);
-
-                        // Only clean emojis when first focusing on a tab (prevents loops)
-                        if is_new_focus {
-                            if self.debug {
-                                eprintln!("[zellij-notify] 🎯 FOCUS: Tab {} '{}' (idx={}, previous: {:?})",
-                                    tab.position, tab.name, idx, self.focused_tab_position);
-                            }
-
-                            self.focused_tab_position = Some(tab.position);
-
-                            // Check if this tab has emojis
-                            let cleaned = remove_trailing_emojis(&tab.name);
-                            if cleaned != tab.name {
-                                if self.debug {
-                                    eprintln!("[zellij-notify] 🔄 CLEAN: '{}' → '{}'", tab.name, cleaned);
-                                }
-
-                                // Zellij uses 1-based indexing, tab.position is 0-based
-                                let tab_index = tab.position as u32 + 1;
-                                rename_tab(tab_index, cleaned);
-                            }
-                        }
-                        break;
-                    }
+                // Strip any stale icons on startup.
+                self.update_tab_names();
+                true
+            }
+            Event::TabUpdate(tab_info) => {
+                self.tabs = tab_info;
+                let blur_cleared = self.check_and_clear_blur();
+                let stale_cleaned = self.clean_stale_notifications();
+                if blur_cleared
+                    || stale_cleaned
+                    || self.has_pending_restores()
+                    || self.has_stale_icons()
+                {
+                    self.update_tab_names();
                 }
                 false
             }
             Event::PaneUpdate(pane_manifest) => {
-                if self.debug {
-                    eprintln!("[zellij-notify] 🗂️  PANE UPDATE: Received PaneManifest");
-                    eprintln!("[zellij-notify]   Number of tabs with panes: {}", pane_manifest.panes.len());
+                self.panes = pane_manifest;
+                let blur_cleared = self.check_and_clear_blur();
+                let stale_cleaned = self.clean_stale_notifications();
+                if blur_cleared
+                    || stale_cleaned
+                    || self.has_pending_restores()
+                    || self.has_stale_icons()
+                {
+                    self.update_tab_names();
                 }
-
-                // Store the pane manifest so we can map pane IDs to tabs
-                self.pane_manifest = Some(pane_manifest);
                 false
             }
-            _ => false
+            _ => false,
         }
     }
 
     fn render(&mut self, _rows: usize, _cols: usize) {}
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        // Only handle "notify" commands
-        if pipe_message.name != "notify" {
-            return false;
+        if self.debug {
+            eprintln!(
+                "[zellij-notify] pipe received name='{}' payload={:?} args={:?}",
+                pipe_message.name, pipe_message.payload, pipe_message.args
+            );
         }
+
+        let parsed = Self::parse_pipe_message(&pipe_message);
+
+        // Unblock the CLI pipe immediately so the caller never hangs.
+        unblock_cli_pipe_input(&pipe_message.name);
+
+        let (event_name, pane_id) = match parsed {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                if self.debug {
+                    eprintln!("[zellij-notify] {}", err);
+                }
+                return false;
+            }
+        };
+
+        let emoji = self.config.resolve_emoji(Some(&event_name));
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.notification_state.insert(
+            pane_id,
+            NotificationState {
+                name: if event_name.is_empty() {
+                    "default".to_string()
+                } else {
+                    event_name.clone()
+                },
+                emoji: emoji.clone(),
+                sequence: self.next_sequence,
+            },
+        );
 
         if self.debug {
-            eprintln!("[zellij-notify] 📨 PIPE received!");
-            eprintln!("[zellij-notify]   Name: {}", pipe_message.name);
-            eprintln!("[zellij-notify]   Payload: {:?}", pipe_message.payload);
-            eprintln!("[zellij-notify]   Source: {:?}", pipe_message.source);
-            eprintln!("[zellij-notify]   Args: {:?}", pipe_message.args);
-            eprintln!("[zellij-notify]   Is Private: {}", pipe_message.is_private);
-
-            // Log session_name and tab_name if provided
-            if let Some(session_name) = pipe_message.args.get("session_name") {
-                eprintln!("[zellij-notify]   Session name: {}", session_name);
-            }
-            if let Some(tab_name) = pipe_message.args.get("tab_name") {
-                eprintln!("[zellij-notify]   Tab name: {}", tab_name);
-            }
-
-            eprintln!("[zellij-notify]   Currently focused tab: {:?}", self.focused_tab_position);
-            eprintln!("[zellij-notify]   All tabs at pipe time:");
-            for tab in &self.all_tabs {
-                eprintln!("[zellij-notify]     - Tab {}: '{}' (active={}, is_sync_panes_active={})",
-                    tab.position, tab.name, tab.active, tab.is_sync_panes_active);
-            }
-        }
-
-        // Get preset based on payload (positional argument)
-        let preset = match pipe_message.payload.as_deref() {
-            None | Some("") => {
-                if self.debug {
-                    eprintln!("[zellij-notify] ✅ Using default preset");
-                }
-                PresetConfig { emoji: "✅".to_string() }
-            }
-            Some(key) => {
-                match self.presets.get(key) {
-                    Some(preset) => {
-                        if self.debug {
-                            eprintln!("[zellij-notify] 📦 Using preset '{}': {}", key, preset.emoji);
-                        }
-                        preset.clone()
-                    }
-                    None => {
-                        if self.debug {
-                            eprintln!("[zellij-notify] ❓ Unknown preset '{}', using fallback", key);
-                        }
-                        PresetConfig { emoji: "❓".to_string() }
-                    }
-                }
-            }
-        };
-
-        let emoji = &preset.emoji;
-
-        // Try to identify which tab sent the pipe command
-        // Method 1: Check if pane_id was passed via args (from shell wrapper)
-        let target_tab_position = if let Some(pane_id) = pipe_message.args.get("pane_id") {
-            if self.debug {
-                eprintln!("[zellij-notify] 🆔 Pane ID provided: {}", pane_id);
-            }
-
-            // Use PaneManifest to find which tab contains this pane
-            if let Some(ref manifest) = self.pane_manifest {
-                // PaneManifest.panes is a BTreeMap<usize, Vec<PaneInfo>>
-                // where the key is the tab position (0-indexed)
-                let mut found_tab: Option<usize> = None;
-                for (tab_position, panes) in &manifest.panes {
-                    // Check if any pane in this tab matches our pane_id
-                    for pane in panes {
-                        if pane.id.to_string() == *pane_id {
-                            found_tab = Some(*tab_position);
-                            if self.debug {
-                                eprintln!("[zellij-notify] ✅ Found pane {} in tab {}", pane_id, tab_position);
-                            }
-                            break;
-                        }
-                    }
-                    if found_tab.is_some() {
-                        break;
-                    }
-                }
-
-                if found_tab.is_none() && self.debug {
-                    eprintln!("[zellij-notify] ⚠️  Pane ID {} not found in PaneManifest", pane_id);
-                }
-
-                found_tab
-            } else {
-                if self.debug {
-                    eprintln!("[zellij-notify] ⚠️  No PaneManifest available yet");
-                }
-                None
-            }
-        } else if let Some(pos_str) = pipe_message.args.get("tab_position") {
-            // Method 2: Check if tab position was explicitly passed via args
-            if self.debug {
-                eprintln!("[zellij-notify] 🎯 Tab position explicitly provided: {}", pos_str);
-            }
-            pos_str.parse::<usize>().ok()
-        } else {
-            // Method 3: Fall back to the currently active tab from our stored state
-            // This is NOT reliable for background commands but works for immediate commands
-            let active_tab = self.all_tabs.iter().find(|t| t.active);
-            if self.debug {
-                if let Some(tab) = active_tab {
-                    eprintln!("[zellij-notify] 🎯 Using active tab from state: {} '{}'",
-                        tab.position, tab.name);
+            eprintln!(
+                "[zellij-notify] Set pane {} -> '{}' ({})",
+                pane_id,
+                emoji,
+                if event_name.is_empty() {
+                    "default"
                 } else {
-                    eprintln!("[zellij-notify] ⚠️  No active tab found in state");
+                    &event_name
                 }
-            }
-            active_tab.map(|t| t.position)
-        };
-
-        // Update the identified tab
-        if let Some(position) = target_tab_position {
-            if let Some(tab) = self.all_tabs.iter().find(|t| t.position == position) {
-                let cleaned_name = remove_trailing_emojis(&tab.name);
-                let new_name = format!("{} {}", cleaned_name, emoji);
-
-                if self.debug {
-                    eprintln!("[zellij-notify] 📝 Renaming tab {}: '{}' → '{}'",
-                        tab.position, tab.name, new_name);
-
-                    // Summary log: TAB_NAME in SESSION_NAME EMOJI
-                    let session_name = pipe_message.args.get("session_name")
-                        .map(|s| s.as_str())
-                        .unwrap_or("unknown");
-                    eprintln!("[zellij-notify] 📍 {} in {} {}",
-                        cleaned_name, session_name, emoji);
-                }
-
-                // Zellij uses 1-based indexing, position is 0-based
-                let tab_index = position as u32 + 1;
-                rename_tab(tab_index, new_name);
-            } else {
-                if self.debug {
-                    eprintln!("[zellij-notify] ⚠️  Tab at position {} not found in stored tabs", position);
-                }
-            }
-        } else {
-            if self.debug {
-                eprintln!("[zellij-notify] ⚠️  Could not identify target tab");
-            }
+            );
         }
 
-        false // No UI re-render needed
+        self.update_tab_names();
+        false
     }
-}
-
-fn remove_trailing_emojis(name: &str) -> String {
-    let emojis = ["🔴", "✅", "❌", "⚠️", "⚡", "💼", "🎉", "❓"];
-    let mut cleaned = name.to_string();
-
-    // Keep removing trailing emojis and whitespace
-    loop {
-        let original_len = cleaned.len();
-        cleaned = cleaned.trim_end().to_string();
-
-        // Try to remove any trailing emoji (check all emojis, don't break early)
-        let mut found_emoji = false;
-        for emoji in emojis {
-            if cleaned.ends_with(emoji) {
-                cleaned = cleaned[..cleaned.len() - emoji.len()].to_string();
-                found_emoji = true;
-                break; // Found one, now trim again and recheck from the start
-            }
-        }
-
-        // If nothing changed (no whitespace trimmed, no emoji removed), we're done
-        if !found_emoji && cleaned.len() == original_len {
-            break;
-        }
-    }
-
-    cleaned
 }

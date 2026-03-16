@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -10,12 +9,14 @@ use std::process::Command;
 // Embed WASM binary at compile time
 const WASM_BYTES: &[u8] = include_bytes!("../../target/wasm32-wasip1/release/zellij_notify.wasm");
 
-// Notification presets (name -> emoji)
+// Default notification presets (name -> emoji)
 const NOTIFY_CONFIG: &[(&str, &str)] = &[
     ("notification", "⚡"),
     ("posttooluse", "⚡"),
     ("stop", "✅"),
     ("subagent-stop", "🔴"),
+    ("waiting", "⏳"),
+    ("completed", "✅"),
 ];
 
 const ZELLIJ_CONFIG_TEMPLATE: &str = r##"plugin location="file:~/.config/zellij/plugins/zellij-notify.wasm" {
@@ -46,7 +47,7 @@ enum Commands {
     },
     /// Send notification to Zellij
     Notify {
-        /// Notification name (notification, stop, posttooluse, subagent-stop)
+        /// Notification preset key or literal emoji (eg. stop, notification, ✅, ⚡)
         name: String,
     },
     /// Install plugin to Zellij
@@ -176,40 +177,27 @@ fn claude_uninstall_hooks() -> Result<()> {
 }
 
 fn notify(name: &str) -> Result<()> {
-    // Look up emoji for this notification name
-    let presets: HashMap<&str, &str> = NOTIFY_CONFIG.iter().copied().collect();
-
-    if !presets.contains_key(name) {
-        bail!("Unknown notification name: '{}'. Available: {}",
-              name,
-              NOTIFY_CONFIG.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "));
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("Notification name cannot be empty");
     }
 
-    // Get Zellij environment variables
+    let pipe_value = NOTIFY_CONFIG
+        .iter()
+        .find(|(preset_name, _)| *preset_name == name)
+        .map(|(_, emoji)| *emoji)
+        .unwrap_or(name);
+
     let pane_id = env::var("ZELLIJ_PANE_ID")
         .context("ZELLIJ_PANE_ID not found. Are you running inside Zellij?")?;
-    let session_name = env::var("ZELLIJ_SESSION_NAME").unwrap_or_default();
-    let tab_name = env::var("ZELLIJ_TAB_NAME").unwrap_or_default();
 
-    // Build and execute zellij pipe command
-    let mut cmd = Command::new("zellij");
-    cmd.arg("pipe")
-        .arg("-n")
-        .arg("notify")
-        .arg("-a")
-        .arg(format!("pane_id={}", pane_id));
-
-    if !session_name.is_empty() {
-        cmd.arg("-a").arg(format!("session_name={}", session_name));
-    }
-
-    if !tab_name.is_empty() {
-        cmd.arg("-a").arg(format!("tab_name={}", tab_name));
-    }
-
-    cmd.arg(name);
-
-    let output = cmd.output()
+    let output = Command::new("zellij")
+        .arg("pipe")
+        .arg("--name")
+        .arg(format!("notify::{}::{}", pipe_value, pane_id))
+        .arg("--")
+        .arg("")
+        .output()
         .context("Failed to execute zellij pipe command")?;
 
     if !output.status.success() {
